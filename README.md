@@ -7,6 +7,7 @@ Reseach about adversarial patches suitable for military domains
 ## Repository Info
 본 Repository는 EAVAISE의 Adversarial YOLO 구현을 기반으로 한다 : https://gitlab.com/EAVISE/adversarial-yolo   
 본 Repository는 이 연구의 보고서를 따른다 : 보고서 링크
+위 연구의 Demo 영상은 다음과 같다 : 유튜브 링크
  
 ## How to Use
 ### Requirement
