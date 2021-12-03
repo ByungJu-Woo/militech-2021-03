@@ -103,9 +103,6 @@ class Evaluator(object):
         if os.path.exists(save_path) == False:
             os.mkdir(save_path)
         name = '/'+self.save_name+'_AP.mat'
-        #name = '/'+'standard_military_AP.mat'
-        # '/{time_str}_AP.mat'
-        #print('what? ',save_path+name)
         print("save name is", name)
         savemat(save_path+name, mdic)
         print (auc)

@@ -3,10 +3,7 @@ Training code for Adversarial patch training
 
 
 """
-# 1. 여기서 savemat 기능 import하기 !
-#############################
-from scipy.io import savemat
-#############################
+
 import PIL
 import load_data
 from tqdm import tqdm
@@ -23,6 +20,13 @@ import patch_config
 import sys
 import time
 
+#############################
+import os
+from scipy.io import savemat
+import warnings
+warnings.filterwarnings(action='ignore')
+#############################
+
 class PatchTrainer(object):
     def __init__(self, mode):
         self.config = patch_config.patch_configs[mode]()
@@ -32,10 +36,19 @@ class PatchTrainer(object):
         self.darknet_model = self.darknet_model.eval().cuda() # TODO: Why eval?
         self.patch_applier = PatchApplier().cuda()
         self.patch_transformer = PatchTransformer().cuda()
-        self.prob_extractor = MaxProbExtractor(0,80, self.config).cuda()
-        self.total_variation = TotalVariation().cuda()
-        self.content_loss = ContentLossCalculator().cuda()
+        
+        ##
+        self.prob_extractor = MaxProbExtractor(0,80, self.config).cuda() # DET LOSS
+        self.total_variation = TotalVariation().cuda() # TV LOSS
+        self.MSE_calculator= MSECalculator().cuda() # MSE LOSS
+        self.camouflage_calculator = CamouflageCalculator().cuda() # CF LOSS
+        self.perceptual_calculator = VGGPerceptualLoss().cuda() # PC LOSS
+        ##
+
+        self.patch_name = 'PATCH B'
         self.writer = self.init_tensorboard(mode)
+
+        
 
     def init_tensorboard(self, name=None):
         subprocess.Popen(['tensorboard', '--logdir=runs'])
@@ -57,13 +70,11 @@ class PatchTrainer(object):
         max_lab = 14
 
         time_str = time.strftime("%Y%m%d-%H%M%S")
-
      
-
-        adv_patch_cpu = self.read_image("saved_patches/600300.jpg")
-        
-        ####################################################################
-        orig_patch_cpu = self.read_image("saved_patches/600300.jpg")
+        # Generate starting point
+        # adv_patch_cpu = self.generate_patch("gray")
+        adv_patch_cpu = self.read_image("saved_patches/MILITARY.jpg")
+        orig_patch_cpu = self.read_image("saved_patches/MILITARY.jpg")
           
         adv_patch_cpu.requires_grad_(True)
         
@@ -80,22 +91,17 @@ class PatchTrainer(object):
         scheduler = self.config.scheduler_factory(optimizer)
 
         et0 = time.time()
-        # 2. for문 시작전에 loss들을 저장할 수 있는 빈 리스트 생성하기
-        #########################################################
-        tv_loss_list, ct_loss_list, det_loss_list= [], [], []
-        ############################################################
+
+        tv_loss_list, MSE_loss_list, det_loss_list, cf_loss_list, pc_loss_list = [], [], [], [], []
 
         for epoch in range(n_epochs):
             ep_det_loss = 0
-            #ep_nps_loss = 0
             ep_tv_loss = 0
-            ##############
-            #ep_sim_loss = 0
+            ep_MSE_loss = 0
             ep_cf_loss = 0
-            ep_ct_loss = 0
-            #ep_svm_loss =0
-            #################
+            ep_pc_loss = 0
             ep_loss = 0
+            
             bt0 = time.time()
             for i_batch, (img_batch, lab_batch) in tqdm(enumerate(train_loader), desc=f'Running epoch {epoch}', total=self.epoch_length):
                 with autograd.detect_anomaly():
@@ -103,11 +109,9 @@ class PatchTrainer(object):
                     lab_batch = lab_batch.cuda()
                     #print('TRAINING EPOCH %i, BATCH %i'%(epoch, i_batch))
                     adv_patch = adv_patch_cpu.cuda()
-                    ####################################################################
                     orig_patch = orig_patch_cpu.cuda()
                     
                     #ref_patch = ref_patch_cpu.cuda()
-                    ####################################################################
                     adv_batch_t = self.patch_transformer(adv_patch, lab_batch, img_size, do_rotate=True, rand_loc=False)
                     p_img_batch = self.patch_applier(img_batch, adv_batch_t)
                     p_img_batch = F.interpolate(p_img_batch, (self.darknet_model.height, self.darknet_model.width))
@@ -116,32 +120,48 @@ class PatchTrainer(object):
                     img = transforms.ToPILImage()(img.detach().cpu())
                     #img.show()
 
+
+                    #################################################
                     output = self.darknet_model(p_img_batch)
                     max_prob = self.prob_extractor(output)
                     tv = self.total_variation(adv_patch)
-                    ct =  self.content_loss(orig_patch, adv_patch, epoch)
-                    #######################################3
-                    #if epoch % 5 == 0 and epoch >= 5 :
-                    #    adv_patch = 0.7*adv_patch + 0.3*orig_patch
-                    ####################
-                    tv_loss = tv*1.0
-                    ct_loss = ct*5.00
+                    MSE =  self.MSE_calculator(orig_patch, adv_patch, epoch)
+                    cf = self.camouflage_calculator(adv_patch, orig_patch)
+                    pc = self.perceptual_calculator(adv_patch, orig_patch, epoch)
+                    #################################################
+
+                    # LOSS FOR PATCH A
+                    '''
                     det_loss = torch.mean(max_prob)
+                    tv_loss = tv * 1.0
+                    MSE_loss = MSE * 5.0
+                    loss = det_loss  + torch.max(tv_loss, torch.tensor(0.1).cuda()) + MSE_loss
+                    '''
 
-                    loss = det_loss  + torch.max(tv_loss, torch.tensor(0.1).cuda()) + ct_loss #+svm_loss #+ cf_loss 
-                    #loss= det_loss  + ct_loss + torch.max(tv_loss, torch.tensor(0.1).cuda())+ torch.max(cf_loss, torch.tensor(0.1).cuda())
-
+                    # LOSS FOR PATCH B
+                    det_loss = torch.mean(max_prob)              
+                    tv_loss = tv*1.00
+                    MSE_loss = MSE * 0.50
+                    cf_loss = cf * 2.50
+                    pc_loss = pc * 0.01
+                    loss = det_loss  + tv_loss + ct_loss +pc_loss + cf_loss 
+                    
+                    # epoch LOSS FOR PATCH A
+                    '''
                     ep_det_loss += det_loss.detach().cpu().numpy()
-                    #ep_nps_loss += nps_loss.detach().cpu().numpy()
                     ep_tv_loss += tv_loss.detach().cpu().numpy()
-                    #################
-                    #ep_sim_loss += sim_loss.detach().cpu().numpy()
-                    #ep_cf_loss += cf_loss.detach().cpu().numpy()
-                    ep_ct_loss += ct_loss.detach().cpu().numpy()
-                    #ep_svm_loss += svm_loss.detach().cpu().numpy()
-                    #################
-                    #ep_loss += loss.item()
-                    ep_loss +=loss
+                    ep_MSE_loss += MSE_loss.detach().cpu().numpy()
+                    '''
+
+                    # epoch LOSS FOR PATCH B
+                    ep_det_loss += det_loss.detach().cpu().numpy()
+                    ep_tv_loss += tv_loss.detach().cpu().numpy()
+                    ep_MSE_loss += MSE_loss.detach().cpu().numpy()
+                    ep_cf_loss += cf_loss.detach().cpu().numpy()
+                    ep_pc_loss = pc_loss.detach().cpu().numpy()
+                    ep_loss +=loss.item()
+
+
 
                     loss.backward()
                     optimizer.step()
@@ -151,18 +171,25 @@ class PatchTrainer(object):
                     bt1 = time.time()
                     if i_batch%5 == 0:
                         iteration = self.epoch_length * epoch + i_batch
+                        
 
+                        # print LOSS FOR PATCH A
+                        '''
                         self.writer.add_scalar('total_loss', loss.detach().cpu().numpy(), iteration)
                         self.writer.add_scalar('loss/det_loss', det_loss.detach().cpu().numpy(), iteration)
-                        #self.writer.add_scalar('loss/nps_loss', nps_loss.detach().cpu().numpy(), iteration)
                         self.writer.add_scalar('loss/tv_loss', tv_loss.detach().cpu().numpy(), iteration)
-                        ###########################################################################################
-                        #self.writer.add_scalar('loss/cf_loss', cf_loss.detach().cpu().numpy(), iteration)
-                        self.writer.add_scalar('loss/ct_loss', ct_loss.detach().cpu().numpy(), iteration)
-                        #self.writer.add_scalar('loss/svm_loss', svm_loss.detach().cpu().numpy(), iteration)
+                        self.writer.add_scalar('loss/MSE_loss', MSE_loss.detach().cpu().numpy(), iteration)
+                        '''
+
+                        # print LOSS FOR PATCH B
+                        self.writer.add_scalar('total_loss', loss.detach().cpu().numpy(), iteration)
+                        self.writer.add_scalar('loss/det_loss', det_loss.detach().cpu().numpy(), iteration)
+                        self.writer.add_scalar('loss/tv_loss', tv_loss.detach().cpu().numpy(), iteration)
+                        self.writer.add_scalar('loss/MSE_loss', MSE_loss.detach().cpu().numpy(), iteration)
+                        self.writer.add_scalar('loss/cf_loss', cf_loss.detach().cpu().numpy(), iteration)
+                        self.writer.add_scalar('loss/pc_loss', pc_loss.detach().cpu().numpy(), iteration)
                         
-                        #self.writer.add_scalar('loss/sim_loss', sim_loss.detach().cpu().numpy(), iteration)
-                        ###########################################################################################
+
                         
                         self.writer.add_scalar('misc/epoch', epoch, iteration)
                         self.writer.add_scalar('misc/learning_rate', optimizer.param_groups[0]["lr"], iteration)
@@ -171,69 +198,67 @@ class PatchTrainer(object):
                     if i_batch + 1 >= len(train_loader):
                         print('\n')
                     else:
-                        del adv_batch_t, output, max_prob, det_loss, p_img_batch, tv_loss, loss, ct_loss #, svm_loss #cf_loss
-                        ##################위에거
+                        del adv_batch_t, output, max_prob, det_loss, p_img_batch, tv_loss, loss, MSE_loss,  cf_loss, pc_loss
                         torch.cuda.empty_cache()
                     bt0 = time.time()
             et1 = time.time()
 
-            ep_det_loss = ep_det_loss/len(train_loader)
-            #ep_nps_loss = ep_nps_loss/len(train_loader)
-            ep_tv_loss = ep_tv_loss/len(train_loader)
-            ##############################
-            #ep_sim_loss = ep_sim_loss/len(train_loader)
-            #ep_cf_loss = ep_cf_loss/len(train_loader)
-            ep_ct_loss = ep_ct_loss/len(train_loader)
-            #ep_svm_loss = ep_svm_loss/len(train_loader)
-            #########################
-            ep_loss = ep_loss/len(train_loader)
-            
             im = transforms.ToPILImage('RGB')(adv_patch_cpu)
-            #im = transforms.ToPILImage('RGB')(adv_patch)
-            #plt.imshow(im)
-            #plt.savefig(f'pics/{time_str}_{self.config.patch_name}_{epoch}.png')
             im.save(f'pics/{time_str}_epoch{epoch}.jpg')
+
+            # PATCH A MATFILE
+            '''
+            ep_det_loss = ep_det_loss/len(train_loader)
+            ep_tv_loss = ep_tv_loss/len(train_loader)
+            ep_MSE_loss = ep_MSE_loss/len(train_loader)
+            ep_loss = ep_loss/len(train_loader)
             scheduler.step(ep_loss)
 
-            # 3. 이미지를 저장한 이후 각 list별로 loss를 append해주고 mat 생성
-            ############################################################
             det_loss_list.append(ep_det_loss)
             ct_loss_list.append(ep_ct_loss)
             tv_loss_list.append(ep_tv_loss)
             mdic = {"det_loss": det_loss_list, "ct_loss": ct_loss_list, "tv_loss": tv_loss_list}
+            '''
+
+            # PATCH B MATFILE
+            ep_det_loss = ep_det_loss/len(train_loader)
+            ep_tv_loss = ep_tv_loss/len(train_loader)
+            ep_MSE_loss = ep_MSE_loss/len(train_loader)
+            ep_cf_loss = ep_cf_loss/len(train_loader)
+            ep_pc_loss = ep_pc_loss/len(train_loader)
+            ep_loss = ep_loss/len(train_loader)
+            scheduler.step(ep_loss)
+
+            det_loss_list.append(ep_det_loss)
+            tv_loss_list.append(ep_tv_loss)
+            MSE_loss_list.append(ep_MSE_loss)
+            cf_loss_list.append(ep_cf_loss)
+            pc_loss_list.append(ep_pc_loss)
+            mdic = {"det_loss": det_loss_list, "tv_loss": tv_loss_list, "MSE_loss": MSE_loss_list, "cf_loss": cf_loss_list, "pc_loss":pc_loss_list}
+            
             save_path = "/content/drive/MyDrive/adversarial-yolo/result"
-            # 위의 save_path는 당신이 mat파일을 저장할 폴더로
             if os.path.exists(save_path) == False:
                 os.mkdir(save_path)
-            savemat(save_path + '/112001_log.mat', mdic)
-            # 위의 savemat 할때 이름을 원하는 이름으로
-            # 주의! 새로운 조건으로 train 할때마다 이름 바꿔주기
-            # 아니면 그전 로그 덮어쓰기됨 ! 
+            savemat(save_path + self.patch_name, mdic)
             ############################################################
             if True:
                
                 print('  EPOCH NR: ', epoch),
                 print('EPOCH LOSS: ', ep_loss)
                 print('  DET LOSS: ', ep_det_loss)
-                #print('  NPS LOSS: ', ep_nps_loss)
                 print('   TV LOSS: ', ep_tv_loss)
-                ##################
-                #print('   SIM LOSS: ', ep_sim_loss)
-                #print('   CF LOSS: ', ep_cf_loss)
+                print('   CF LOSS: ', ep_cf_loss)
                 print('   CT LOSS: ', ep_ct_loss)
-                #print('   SVM LOSS: ', ep_svm_loss)
-                
-                ##################
+
                 print('EPOCH TIME: ', et1-et0)
                 im = transforms.ToPILImage('RGB')(adv_patch_cpu)
                 
                 plt.imshow(im)
                 plt.show()
+            
                 
-                name = '/'+ time.strftime("%Y%m%d")+'_1_6_crop_2to1_aft50.jpg'####mine
-        
-                im.save("saved_patches"+name) # final patch img
-                del adv_batch_t, output, max_prob, det_loss, p_img_batch, tv_loss, loss, ct_loss #, svm_loss ##추가
+                im.save("saved_patches/"+time.strftime("%m%d")+'_'+self.patch_name+'.jpg') # final patch img
+                del adv_batch_t, output, max_prob, det_loss, p_img_batch, tv_loss, loss, MSE_loss, cf_loss, pc_loss 
                 torch.cuda.empty_cache()
               
                 #sys.stdout.close()#######mine
@@ -247,8 +272,7 @@ class PatchTrainer(object):
         :return:
         """
         if type == 'gray':
-            #adv_patch_cpu = torch.full((3, self.config.patch_size, self.config.patch_size), 0.5)
-            adv_patch_cpu = torch.full((3,300,150), 0.5)
+            adv_patch_cpu = torch.full((3,600,300), 0.5)
         elif type == 'random':
             adv_patch_cpu = torch.rand((3, self.config.patch_size, self.config.patch_size))
 
@@ -262,8 +286,6 @@ class PatchTrainer(object):
         :return: Returns the transformed patch as a pytorch Tensor.
         """
         patch_img = Image.open(path).convert('RGB')
-        #tf=transforms.Resize(self.config.patch_size))
-        #tf =transforms.Resize((self.config.patch_size, self.config.patch_size))
         tf=transforms.Resize([600,300])
 
         patch_img = tf(patch_img)

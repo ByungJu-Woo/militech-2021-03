@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 ####################################
 import cv2
+import torchvision
 from sklearn.svm import SVC
 from sklearn.model_selection import KFold
 from sklearn.model_selection import GridSearchCV
@@ -30,8 +31,9 @@ im = Image.open('data/horse.jpg').convert('RGB')
 print('img read!')
 
 import patch_config 
-#new
 
+# DET LOSS
+# USED FOR BOTH PATCH A, PATCH B
 class MaxProbExtractor(nn.Module):
     """MaxProbExtractor: extracts max class probability for class from YOLO output.
 
@@ -71,6 +73,11 @@ class MaxProbExtractor(nn.Module):
 
         return max_conf
 
+
+
+
+# TV LOSS
+# USED FOR BOTH PATCH A, PATCH B
 class TotalVariation(nn.Module):
     """TotalVariation: calculates the total variation of a patch.
 
@@ -90,31 +97,105 @@ class TotalVariation(nn.Module):
         tv = tvcomp1 + tvcomp2
         return tv/torch.numel(adv_patch)
 
-class ContentLossCalculator(nn.Module):
-  def __init__(self):
-        super(ContentLossCalculator, self).__init__()
+
+# MSE LOSS
+# USED FOR BOTH PATCH A, PATCH B
+class MSECalculator(nn.Module):
+    def __init__(self):
+        super(MSECalculator, self).__init__()
         
-  def forward(self, orig_patch, adv_patch, epoch):
-    ##orig_patch crop?###################
-    return torch.mean((orig_patch-adv_patch)**2)
-    # pls = transforms.Compose([
-    #   transforms.RandomCrop((600,300)),
-    #   transforms.RandomHorizontalFlip(),
-    #   transforms.ToTensor(),
-    # ])
-    # img0 = Image.open("/content/drive/MyDrive/adversarial-yolo/saved_patches/600300.jpg")
-    # img1 = pls(img0)
-    # ref = img1.cuda()
+    def forward(self, orig_patch, adv_patch, epoch):
+        return torch.mean((orig_patch-adv_patch)**2)
 
-    # ####################################
-    # if epoch < 5 or epoch%3==0 :
-    #   return torch.mean((orig_patch - adv_patch) ** 2)
-    # else:
-    #   return 0.5*torch.mean((ref - adv_patch) ** 2)
 
-###################################################
 
-#2:1붙이기
+# CF LOSS
+# USED FOR PATCH B
+class CamouflageCalculator(nn.Module):
+    """CamouflageCalculator: calculates difference between adv_patch and orig_patch
+    """
+
+    def __init__(self):
+        super(CamouflageCalculator, self).__init__()
+
+    def forward(self, adv_patch, orig_patch):
+        pls = transforms.Compose([
+          transforms.RandomCrop((600,300)),
+          transforms.RandomHorizontalFlip(),
+          transforms.ToTensor(),
+        ])
+        img0 = Image.open("/content/drive/MyDrive/adversarial-yolo/saved_patches/marpat_top_crop_2.jpg")
+        img1 = pls(img0)
+        ref = img1.cuda()
+        red_diff = torch.abs((adv_patch[0,:,:]-ref[0,:,:]+0.000001)**2)
+        green_diff = torch.abs((adv_patch[1,:,:]-ref[1,:,:]+0.000001)**2)
+        blue_diff = torch.abs((adv_patch[2,:,:]-ref[2,:,:]+0.000001)**2)
+        diff = 0.4*red_diff + 0.1*green_diff + 0.3*blue_diff 
+        diff = torch.sum(torch.sum(diff,0),0)
+        return diff/torch.numel(adv_patch)
+
+
+# PC LOSS
+# USED FOR PATCH B
+class VGGPerceptualLoss(torch.nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        blocks = []
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[:4].eval())
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[4:9].eval())
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[9:16].eval())
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[16:23].eval())
+        for bl in blocks:
+            for p in bl.parameters():
+                p.requires_grad = False
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.transform = torch.nn.functional.interpolate
+        self.resize = resize
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, input, target, epoch, feature_layers=[0, 1, 2, 3], style_layers=[],):
+        input = torch.unsqueeze(input, dim=0)
+        
+        pls = transforms.Compose([
+          transforms.RandomCrop((600,300)),
+          transforms.RandomHorizontalFlip(),
+          transforms.ToTensor(),
+        ])
+        img0 = Image.open("/content/drive/MyDrive/adversarial-yolo/saved_patches/marpat_top_crop_2.jpg")
+        img1 = pls(img0)
+        ref = img1.cuda()
+
+        if (epoch%10 == 9):
+            target = torch.unsqueeze(ref, dim=0)
+        else :
+            target = torch.unsqueeze(target, dim=0)
+
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        input = (input-self.mean) / self.std
+        target = (target-self.mean) / self.std
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+        loss = 0.0
+        x = input
+        y = target
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            y = block(y)
+            if i in feature_layers:
+                loss += torch.nn.functional.l1_loss(x, y)
+            if i in style_layers:
+                act_x = x.reshape(x.shape[0], x.shape[1], -1)
+                act_y = y.reshape(y.shape[0], y.shape[1], -1)
+                gram_x = act_x @ act_x.permute(0, 2, 1)
+                gram_y = act_y @ act_y.permute(0, 2, 1)
+                loss += torch.nn.functional.l1_loss(gram_x, gram_y)
+        return loss
+
+
 class PatchTransformer(nn.Module):
     """PatchTransformer: transforms batch of patches
 
@@ -193,7 +274,6 @@ class PatchTransformer(nn.Module):
 
         # Pad patch and mask to image dimensions
         
-        #요기!!! 1:1 / 1:2
         #mypad = nn.ConstantPad2d((int(pad + 0.5), int(pad), int(pad + 0.5), int(pad)), 0)
         mypad = nn.ConstantPad2d((int(pad + 0.5), int(pad), int(pad_y + 0.5), int(pad_y)), 0)
         adv_batch = mypad(adv_batch)
@@ -361,9 +441,9 @@ class InriaDataset(Dataset):
         image = transform(image)
         label = self.pad_lab(label)
         img_names = self.img_names[idx]
-        #for train
+        # FOR TRAIN
         #return image, label
-        #for test
+        # FOR TEST
         return image, label, img_names
 
     def pad_and_scale(self, img, lab):

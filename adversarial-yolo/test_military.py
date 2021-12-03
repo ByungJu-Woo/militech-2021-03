@@ -84,13 +84,7 @@ class PatchTrainer(object):
  
         test_img_dir = "/content/drive/MyDrive/custom_model_training/inria_person_data/inria/Test/pos"
         test_lab_dir = "/content/drive/MyDrive/custom_model_training/inria_person_data/inria/Test/pos/gt_label"
-        '''
-        train_loader = torch.utils.data.DataLoader(InriaDataset(self.config.img_dir, self.config.lab_dir,
-                                                                max_lab, img_size, shuffle=False),
-                                                   batch_size=8,
-                                                   shuffle=False,
-                                                   num_workers=10)#10 to 2
-        '''
+
         train_loader = torch.utils.data.DataLoader(InriaDataset(test_img_dir,test_lab_dir,
                                                                 max_lab, img_size, shuffle=False),
                                                    batch_size=8,
@@ -100,8 +94,7 @@ class PatchTrainer(object):
         self.epoch_length = len(train_loader)
 
         patch_img = Image.open("/content/drive/MyDrive/adversarial-yolo/result/patches/"+self.pic_name+".jpg").convert('RGB')    #### generated patch use
-        tf = transforms.Resize((300, 300))##
-        #tf = transforms.Resize((300, 300))
+        tf = transforms.Resize((600, 300))##
         patch_img = tf(patch_img)
         tf = transforms.ToTensor()
         adv_patch_cpu = tf(patch_img)
@@ -131,7 +124,6 @@ def main():
     _weightfile = "/content/drive/MyDrive/adversarial-yolo/weights/yolo.weight"
     _image_dir = "/content/drive/MyDrive/adversarial-yolo/result/test_military"
     _save_root = "/content/drive/MyDrive/adversarial-yolo/result/test_military_detection"
-
     
     trainer.image_save(save_path=_image_dir)
     trainer.detect( weightfile = _weightfile,                 #### detection result with an adversarial patch
